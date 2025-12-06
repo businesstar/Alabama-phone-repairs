@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alabama Phone Repairs | Birmingham, AL</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Lucide Icons for aesthetic components -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set Firebase Log Level to Debug for development/error checking
+        setLogLevel('debug');
+
+        // --- GLOBAL FIREBASE & APP VARIABLES ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+        let app, db, auth;
+        let currentUserId = 'unknown';
+
+        // --- UTILITY FUNCTIONS ---
+
+        // Function to handle exponential backoff for API calls
+        async function fetchWithBackoff(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status === 429 && i < maxRetries - 1) {
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        console.warn(`Rate limit hit, retrying in ${Math.round(delay / 1000)}s...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response;
+                } catch (error) {
+                    if (i === maxRetries - 1) {
+                        throw error;
+                    }
+                }
+            }
+        }
+
+        // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+        async function initializeFirebase() {
+            try {
+                if (!firebaseConfig || Object.keys(firebaseConfig).length === 0) {
+                    console.error("Firebase config is missing or empty. Cannot initialize Firestore.");
+                    return;
+                }
+                
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Sign in using the provided custom token or anonymously
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                currentUserId = auth.currentUser?.uid || 'anonymous';
+                document.getElementById('user-id-display').textContent = `User ID: ${currentUserId}`;
+
+                startChatListener();
+
+            } catch (error) {
+                console.error("Error during Firebase initialization or authentication:", error);
+                document.getElementById('chat-messages').innerHTML = `<p class="text-red-500 p-4 text-sm">Error initializing chat: ${error.message}. Check console for details.</p>`;
+            }
+        }
+
+        // --- CHAT FUNCTIONS (Feature 1: Conversational Assistant) ---
+
+        // Gemini API configuration
+        const API_MODEL = 'gemini-2.5-flash-preview-09-2025';
+        const API_KEY = "";
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${API_MODEL}:generateContent?key=${API_KEY}`;
+        const SYSTEM_INSTRUCTION = "You are a friendly and knowledgeable customer service agent for 'Alabama Phone Repairs' in Birmingham, AL. Your primary focus is quick, affordable repairs for devices like iPhones and Samsung Galaxy phones. Always state that all common iPhone repairs (screen, battery) cost between $60 and $100. Always keep answers concise and professional. Do not accept appointments; tell the user to visit our shop or call us. Mention our location is Birmingham, AL.";
+
+        async function getGeminiResponse(message) {
+            const payload = {
+                contents: [{ parts: [{ text: message }] }],
+                tools: [{ "google_search": {} }], // Enable grounding for up-to-date info
+                systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            try {
+                const response = await fetchWithBackoff(API_URL, options);
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    return candidate.content.parts[0].text;
+                } else {
+                    console.error("Gemini response lacked text content:", result);
+                    return "Sorry, I'm having trouble connecting right now. Please try again or call us!";
+                }
+            } catch (error) {
+                console.error("Gemini API call failed:", error);
+                return "Our digital assistant is currently unavailable. Please call our store for assistance.";
+            }
+        }
+
+        const CHAT_COLLECTION_PATH = `artifacts/${appId}/public/data/chat_messages`;
+
+        async function sendMessage(text) {
+            if (!db) {
+                console.error("Firestore not initialized.");
+                return;
+            }
+
+            const chatMessagesDiv = document.getElementById('chat-messages');
+            const chatInput = document.getElementById('chat-input');
+            const sendButton = document.getElementById('send-button');
+
+            // Disable input while processing
+            chatInput.disabled = true;
+            sendButton.disabled = true;
+            sendButton.innerHTML = `<svg class="animate-spin h-5 w-5 mr-3 text-white" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Sending...`;
+
+            try {
+                // 1. Send User Message to Firestore
+                await addDoc(collection(db, CHAT_COLLECTION_PATH), {
+                    userId: currentUserId,
+                    text: text,
+                    timestamp: serverTimestamp(),
+                    role: 'user',
+                    appId: appId
+                });
+
+                // 2. Get Gemini Response
+                const geminiText = await getGeminiResponse(text);
+
+                // 3. Send Gemini Response to Firestore
+                await addDoc(collection(db, CHAT_COLLECTION_PATH), {
+                    userId: 'AlabamaPhoneRepairs-Bot',
+                    text: geminiText,
+                    timestamp: serverTimestamp(),
+                    role: 'bot',
+                    appId: appId
+                });
+
+                chatInput.value = ''; // Clear input after successful send
+
+            } catch (e) {
+                console.error("Error sending message or getting Gemini response: ", e);
+                chatMessagesDiv.innerHTML += `<div class="p-2 text-sm text-red-500 text-center">Failed to send message.</div>`;
+            } finally {
+                // Re-enable input
+                chatInput.disabled = false;
+                sendButton.disabled = false;
+                sendButton.innerHTML = `Send`;
+                chatInput.focus();
+            }
+        }
+
+        function startChatListener() {
+            if (!db) return;
+
+            const chatMessagesDiv = document.getElementById('chat-messages');
+            const q = query(collection(db, CHAT_COLLECTION_PATH), orderBy('timestamp', 'asc'));
+
+            onSnapshot(q, (snapshot) => {
+                let messagesHtml = '';
+                snapshot.docs.forEach(doc => {
+                    const data = doc.data();
+                    const isBot = data.role === 'bot';
+                    const isCurrentUser = data.userId === currentUserId && data.role === 'user';
+                    
+                    const time = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '...';
+                    
+                    let senderName = isBot ? 'APR Bot' : (isCurrentUser ? 'You' : data.userId);
+                    if (senderName.length > 15) {
+                        // Truncate long user IDs for display readability
+                        senderName = isBot ? 'APR Bot' : 'User...'; 
+                    }
+
+                    const messageClass = isBot
+                        ? 'bg-blue-100 text-gray-800 self-start rounded-b-xl rounded-tr-xl'
+                        : (isCurrentUser
+                            ? 'bg-red-500 text-white self-end rounded-b-xl rounded-tl-xl'
+                            : 'bg-gray-200 text-gray-800 self-start rounded-b-xl rounded-tr-xl');
+                    
+                    const nameColor = isBot ? 'text-blue-600' : 'text-xs text-gray-400';
+
+                    messagesHtml += `
+                        <div class="flex flex-col mb-4 ${isCurrentUser ? 'items-end' : 'items-start'}">
+                            <div class="px-3 py-1 ${nameColor} font-semibold">${senderName}</div>
+                            <div class="${messageClass} p-3 max-w-xs md:max-w-md shadow-md break-words">
+                                ${data.text.replace(/\n/g, '<br>')}
+                                <span class="block mt-1 text-xs opacity-70 ${isCurrentUser ? 'text-white' : 'text-gray-500'}">${time}</span>
+                            </div>
+                        </div>
+                    `;
+                });
+                chatMessagesDiv.innerHTML = messagesHtml;
+                chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight; // Auto-scroll to bottom
+            }, (error) => {
+                console.error("Error listening to chat messages:", error);
+                chatMessagesDiv.innerHTML = `<p class="text-red-500 p-4 text-sm text-center">Failed to load messages. Check connection.</p>`;
+            });
+        }
+        
+        // --- QUOTE FUNCTIONS (Feature 2: Structured Quote Estimator) ---
+        
+        const QUOTE_SYSTEM_INSTRUCTION = "You are an AI estimator for 'Alabama Phone Repairs' in Birmingham, AL. Based on the user's phone model and damage type, provide a specific repair estimate. ALL screen and battery repairs for iPhones MUST be quoted between $60 and $100. Repair time should be a realistic range (e.g., 45-90 minutes).";
+
+        // IMPORTANT: Use alert() replacement since actual alert() is blocked in the iframe
+        function displayAlert(message) {
+            const alertBox = document.getElementById('custom-alert');
+            alertBox.textContent = message;
+            alertBox.classList.remove('hidden');
+            setTimeout(() => {
+                alertBox.classList.add('hidden');
+            }, 3000);
+        }
+
+        async function getRepairQuote(model, damage) {
+            const quoteResultDiv = document.getElementById('quote-result');
+            const quoteButton = document.getElementById('quote-button');
+            
+            if (!model || !damage) {
+                displayAlert("Please enter both the phone model and damage type to get a quote.");
+                return;
+            }
+
+            quoteButton.disabled = true;
+            quoteButton.innerHTML = `<svg class="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Generating Quote...`;
+            quoteResultDiv.innerHTML = `<p class="text-center text-sm text-gray-500 p-4">Calculating the best estimate...</p>`;
+
+            const userQuery = `Provide a repair quote for a ${model} with ${damage}.`;
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: QUOTE_SYSTEM_INSTRUCTION }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            estimatedPrice: { 
+                                type: "STRING", 
+                                description: "The estimated price range, formatted as '$X - $Y'." 
+                            },
+                            estimatedTime: { 
+                                type: "STRING", 
+                                description: "The estimated repair duration, formatted as 'X to Y minutes'." 
+                            },
+                            disclaimer: {
+                                type: "STRING",
+                                description: "A brief disclaimer stating the quote is non-binding and requires a free in-store diagnostic."
+                            }
+                        },
+                        required: ["estimatedPrice", "estimatedTime", "disclaimer"]
+                    }
+                }
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            try {
+                const response = await fetchWithBackoff(API_URL, options);
+                const result = await response.json();
+                
+                let jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!jsonText) throw new Error("API returned no valid JSON text.");
+                
+                const quote = JSON.parse(jsonText);
+
+                const html = `
+                    <h5 class="text-xl font-bold text-gray-800 mb-3 flex items-center justify-center"><i data-lucide="calculator" class="w-6 h-6 mr-2 text-red-500"></i> Your Instant Quote</h5>
+                    <div class="space-y-3">
+                        <p class="text-2xl font-extrabold text-birmingham-red border-b pb-2">Price Estimate: ${quote.estimatedPrice}</p>
+                        <p class="text-lg font-medium text-gray-700">Repair Time: <span class="text-green-600 font-semibold">${quote.estimatedTime}</span></p>
+                        <p class="text-sm text-gray-500 italic pt-2 border-t mt-3">${quote.disclaimer}</p>
+                    </div>
+                `;
+                quoteResultDiv.innerHTML = html;
+                lucide.createIcons(); // Re-render new icons
+                
+            } catch (error) {
+                console.error("Error generating quote:", error);
+                quoteResultDiv.innerHTML = `<p class="text-center text-red-500 text-sm p-4">Error: Could not generate quote. Please try the chat or call us.</p>`;
+            } finally {
+                quoteButton.disabled = false;
+                quoteButton.innerHTML = `✨ Generate Quote`;
+            }
+        }
+
+        // --- DOM EVENT HANDLERS ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeFirebase();
+
+            const chatForm = document.getElementById('chat-form');
+            const chatInput = document.getElementById('chat-input');
+            
+            chatForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const text = chatInput.value.trim();
+                if (text) {
+                    sendMessage(text);
+                }
+            });
+
+            // Event listener for the new Quote Estimator button
+            const quoteButton = document.getElementById('quote-button');
+            if (quoteButton) {
+                quoteButton.addEventListener('click', () => {
+                    const model = document.getElementById('phone-model-input').value.trim();
+                    const damage = document.getElementById('damage-type-input').value.trim();
+                    getRepairQuote(model, damage);
+                });
+            }
+        });
+    </script>
+    <style>
+        /* Custom styles for professional look */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+        }
+        .section-padding {
+            padding: 4rem 1rem;
+        }
+        .text-birmingham-red { color: #D61A3C; }
+        .bg-birmingham-gray { background-color: #3C4043; }
+        .btn-primary {
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px -1px rgba(220, 38, 38, 0.5), 0 2px 4px -2px rgba(220, 38, 38, 0.5);
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(220, 38, 38, 0.5), 0 4px 6px -4px rgba(220, 38, 38, 0.5);
+        }
+        /* Mobile adjustment for chat box */
+        @media (max-width: 768px) {
+            #chat-container {
+                height: 70vh;
+            }
+        }
+        /* Custom Alert Styling */
+        #custom-alert {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body class="text-gray-800">
+
+    <!-- Custom Alert Box (replaces alert() function) -->
+    <div id="custom-alert" class="hidden bg-yellow-400 text-yellow-900 p-3 rounded-lg shadow-xl text-sm font-semibold transition duration-300">
+        <!-- Message goes here -->
+    </div>
+
+    <!-- Header & Navigation -->
+    <header class="bg-white shadow-lg sticky top-0 z-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <a href="#" class="flex items-center space-x-2">
+                <i data-lucide="wrench" class="w-8 h-8 text-birmingham-red"></i>
+                <h1 class="text-2xl font-extrabold tracking-tight text-birmingham-gray">Alabama Phone Repairs</h1>
+            </a>
+            <p class="hidden sm:block text-sm font-medium text-gray-500">Birmingham, AL's Repair Experts</p>
+        </div>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="bg-birmingham-gray text-white section-padding">
+        <div class="max-w-7xl mx-auto text-center">
+            <div class="space-y-4">
+                <h2 class="text-5xl md:text-6xl font-extrabold tracking-tight leading-tight">
+                    CRACKED SCREEN? NO PROBLEM.
+                </h2>
+                <p class="text-xl md:text-2xl font-light text-gray-300 max-w-3xl mx-auto">
+                    Fast, affordable, and quality phone repair right here in Birmingham, Alabama. Get your device fixed today!
+                </p>
+                <a href="#services" class="inline-flex items-center justify-center px-8 py-3 border border-transparent text-base font-medium rounded-full text-white bg-red-600 hover:bg-red-700 md:py-4 md:text-lg md:px-10 btn-primary">
+                    See Repair Services <i data-lucide="arrow-right" class="w-5 h-5 ml-2"></i>
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Services Section (iPhone Repairs) -->
+    <section id="services" class="bg-white section-padding">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-12">
+                <span class="text-birmingham-red text-lg font-semibold uppercase">Our Expertise</span>
+                <h3 class="mt-2 text-4xl font-bold text-gray-900">Dedicated iPhone & Smartphone Repair</h3>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                <!-- Service Card 1: Screen Repair -->
+                <div class="bg-gray-50 p-6 rounded-xl shadow-lg hover:shadow-xl transition duration-300 border-t-4 border-red-500">
+                    <i data-lucide="screen-share" class="w-10 h-10 text-birmingham-red mb-4"></i>
+                    <h4 class="text-2xl font-bold mb-2">Screen Replacement</h4>
+                    <p class="text-gray-600">Shattered display? We replace cracked glass and faulty LCDs/OLEDs on all iPhone models and most major brands, often in under an hour.</p>
+                </div>
+                
+                <!-- Service Card 2: Battery Replacement -->
+                <div class="bg-gray-50 p-6 rounded-xl shadow-lg hover:shadow-xl transition duration-300 border-t-4 border-red-500">
+                    <i data-lucide="battery-charging" class="w-10 h-10 text-birmingham-red mb-4"></i>
+                    <h4 class="text-2xl font-bold mb-2">Battery Service</h4>
+                    <p class="text-gray-600">Restore your phone's all-day power. Fast battery replacements using high-quality cells. Stop carrying that portable charger!</p>
+                </div>
+                
+                <!-- Service Card 3: Other Fixes -->
+                <div class="bg-gray-50 p-6 rounded-xl shadow-lg hover:shadow-xl transition duration-300 border-t-4 border-red-500">
+                    <i data-lucide="plug-zap" class="w-10 h-10 text-birmingham-red mb-4"></i>
+                    <h4 class="text-2xl font-bold mb-2">Charging & Diagnostics</h4>
+                    <p class="text-gray-600">Fix charging ports, cameras, speakers, and water damage. We offer free diagnostics to pinpoint the problem fast.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Pricing Section -->
+    <section id="pricing" class="bg-gray-100 section-padding">
+        <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <h3 class="text-4xl font-bold text-gray-900 mb-4">Simple, Upfront Pricing</h3>
+            <p class="text-xl text-gray-600 mb-8">
+                We believe in transparent pricing with no hidden fees. All standard repairs fall within a simple, low-cost range.
+            </p>
+
+            <!-- Price Highlight Card -->
+            <div class="bg-white p-8 rounded-2xl shadow-2xl border-b-8 border-red-500">
+                <div class="flex flex-col sm:flex-row items-center justify-center space-y-4 sm:space-y-0 sm:space-x-8">
+                    <i data-lucide="tag" class="w-12 h-12 text-green-500"></i>
+                    <div>
+                        <p class="text-4xl font-extrabold text-birmingham-red">
+                            <span class="text-xl text-gray-500 font-medium">Starting at</span> $60
+                        </p>
+                        <p class="text-sm text-gray-500 mt-1">(Screen, Battery, Camera, etc.)</p>
+                    </div>
+                    <div class="text-4xl font-extrabold text-gray-300 hidden sm:block">/</div>
+                    <div>
+                        <p class="text-4xl font-extrabold text-birmingham-red">
+                            <span class="text-xl text-gray-500 font-medium">Maximum</span> $100
+                        </p>
+                        <p class="text-sm text-gray-500 mt-1">(No surprise costs for standard iPhone fixes)</p>
+                    </div>
+                </div>
+                <div class="mt-6 border-t pt-4">
+                    <p class="text-lg font-medium text-gray-700">
+                        <i data-lucide="smartphone" class="w-5 h-5 inline-block mr-2 text-red-500"></i>
+                        This range (<span class="font-semibold">$60-$100</span>) covers the most common repairs for <span class="font-semibold">ALL iPhone models</span>.
+                    </p>
+                </div>
+            </div>
+
+            <!-- New Feature: AI Quote Estimator -->
+            <div id="quote-estimator" class="mt-12 bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <h4 class="text-2xl font-bold text-gray-900 mb-6 flex items-center justify-center">
+                    <i data-lucide="sparkles" class="w-6 h-6 text-yellow-500 mr-2"></i> AI Quick Quote Estimator
+                </h4>
+                
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <!-- Input 1: Phone Model -->
+                    <input type="text" id="phone-model-input" placeholder="iPhone 14 Pro or Galaxy S23" class="p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500 col-span-1 sm:col-span-1" required>
+                    
+                    <!-- Input 2: Damage Type -->
+                    <input type="text" id="damage-type-input" placeholder="Cracked Screen or Dead Battery" class="p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500 col-span-1 sm:col-span-1" required>
+                    
+                    <!-- Button -->
+                    <button id="quote-button" class="bg-red-600 text-white px-5 py-3 rounded-lg font-semibold hover:bg-red-700 flex items-center justify-center transition duration-200 col-span-1">
+                        ✨ Generate Quote
+                    </button>
+                </div>
+                
+                <!-- Result Display Area -->
+                <div id="quote-result" class="mt-6 p-4 bg-gray-50 rounded-lg border border-gray-200 min-h-[100px] flex items-center justify-center">
+                    <p class="text-gray-500">Enter your device details above to get an instant estimate.</p>
+                </div>
+            </div>
+            
+            <p class="text-sm text-gray-500 mt-6">*Complex water damage or specialized board repair may require a custom quote.</p>
+        </div>
+    </section>
+
+    <!-- Live Chat & Contact Section -->
+    <section id="contact" class="bg-white section-padding">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 lg:grid-cols-2 gap-12">
+            
+            <!-- Contact Info -->
+            <div class="space-y-8">
+                <h3 class="text-4xl font-bold text-gray-900">Ready to Get Fixed?</h3>
+                <p class="text-lg text-gray-600">
+                    Visit our Birmingham location today for a free diagnostic. Most repairs are completed while you wait!
+                </p>
+                
+                <div class="space-y-4">
+                    <div class="flex items-start space-x-4">
+                        <i data-lucide="map-pin" class="w-6 h-6 text-birmingham-red flex-shrink-0 mt-1"></i>
+                        <div>
+                            <p class="font-semibold text-xl">Location</p>
+                            <p class="text-gray-700" Birmingham, AL 35203 </p>
+                        </div>
+                    </div>
+                    <div class="flex items-start space-x-4">
+                        <i data-lucide="clock" class="w-6 h-6 text-birmingham-red flex-shrink-0 mt-1"></i>
+                        <div>
+                            <p class="font-semibold text-xl">Hours</p>
+                            <p class="text-gray-700">Mon -sun: 7:00 AM -9:00 P</p>
+                        </div>
+                    </div>
+                    <div class="flex items-start space-x-4">
+                        <i data-lucide="phone" class="w-6 h-6 text-birmingham-red flex-shrink-0 mt-1"></i>
+                        <div>
+                            <p class="font-semibold text-xl">Call Us</p>
+                            <p class="text-gray-700">(737 239 1090)</p>
+                        </div>
+                    </div>
+                </div>
+                <p id="user-id-display" class="text-sm text-gray-400 mt-4"></p>
+            </div>
+
+            <!-- Live Chat Section -->
+            <div class="bg-gray-100 p-6 rounded-xl shadow-2xl flex flex-col h-[500px] lg:h-[600px]" id="chat-container">
+                <h4 class="text-2xl font-bold text-gray-900 mb-4 flex items-center">
+                    <i data-lucide="message-square" class="w-6 h-6 text-birmingham-red mr-2"></i> Live Chat Assistant
+                </h4>
+                
+                <!-- Messages Container -->
+                <div id="chat-messages" class="flex-grow overflow-y-auto space-y-4 p-4 mb-4 bg-white rounded-lg border">
+                    <!-- Initial welcome message -->
+                    <div class="flex flex-col mb-4 items-start">
+                        <div class="px-3 py-1 text-blue-600 font-semibold">APR Bot</div>
+                        <div class="bg-blue-100 text-gray-800 self-start rounded-b-xl rounded-tr-xl p-3 max-w-xs md:max-w-md shadow-md">
+                            Hi there! I'm your AI assistant for Alabama Phone Repairs. How can I help you with your device today? Remember, all standard iPhone fixes are just $60 - $100!
+                            <span class="block mt-1 text-xs opacity-70 text-gray-500">...</span>
+                        </div>
+                    </div>
+                    <!-- Messages will be injected here by JavaScript -->
+                </div>
+
+                <!-- Input Form -->
+                <form id="chat-form" class="flex space-x-3">
+                    <input type="text" id="chat-input" placeholder="Ask about repairs or pricing..." class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500" required>
+                    <button type="submit" id="send-button" class="bg-red-600 text-white px-5 py-3 rounded-lg font-semibold hover:bg-red-700 flex items-center justify-center transition duration-200">
+                        Send
+                    </button>
+                </form>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="bg-birmingham-gray text-white py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <p>&copy; 2024 Alabama Phone Repairs. Serving Birmingham, AL with quality service.</p>
+            <div class="mt-2 text-sm text-gray-400">
+                <a href="#services" class="hover:text-white mx-2">Services</a> | 
+                <a href="#pricing" class="hover:text-white mx-2">Pricing</a> | 
+                <a href="#contact" class="hover:text-white mx-2">Contact</a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Initialize Lucide Icons -->
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+</html>
