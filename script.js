@@ -25,11 +25,11 @@ const estimateForm = document.getElementById("estimateForm");
 const estimateResult = document.getElementById("estimateResult");
 
 const pricing = {
-  "Screen Replacement": { iPhone: [119, 249], Samsung: [129, 279], "Google Pixel": [129, 269], "Other Android": [99, 229] },
-  "Battery Replacement": { iPhone: [59, 129], Samsung: [69, 139], "Google Pixel": [69, 149], "Other Android": [49, 129] },
-  "Charging Port Repair": { iPhone: [69, 159], Samsung: [79, 169], "Google Pixel": [79, 169], "Other Android": [59, 149] },
-  "Water Damage Diagnostic": { iPhone: [39, 89], Samsung: [39, 89], "Google Pixel": [39, 89], "Other Android": [39, 89] },
-  "Camera / Mic / Speaker": { iPhone: [69, 199], Samsung: [79, 219], "Google Pixel": [79, 219], "Other Android": [59, 189] }
+  "Screen Replacement": { iPhone: [49, 199], Samsung: [49, 229], "Google Pixel": [59, 259], "Other Android": [99, 229] },
+  "Battery Replacement": { iPhone: [40, 129], Samsung: [69, 139], "Google Pixel": [69, 149], "Other Android": [49, 129] },
+  "Charging Port Repair": { iPhone: [49, 159], Samsung: [79, 169], "Google Pixel": [79, 169], "Other Android": [59, 149] },
+  "Water Damage Diagnostic": { iPhone: [19, 89], Samsung: [39, 89], "Google Pixel": [39, 89], "Other Android": [39, 89] },
+  "Camera / Mic / Speaker": { iPhone: [29, 199], Samsung: [79, 219], "Google Pixel": [79, 219], "Other Android": [59, 189] }
 };
 
 if (estimateForm && estimateResult) {
